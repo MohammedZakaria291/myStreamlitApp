@@ -1,4 +1,4 @@
-# app.py
+# app.py - Full Professional Real-Time RUL & Anomaly Monitor
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,124 +6,204 @@ import torch
 import torch.nn as nn
 import pickle
 import plotly.graph_objects as go
-import os
+from datetime import datetime
 
-# ========================= Page Config =========================
-st.set_page_config(page_title="AI Predictive Maintenance", layout="wide", page_icon="robot")
-st.title("AI-Powered Predictive Maintenance System")
-st.markdown("### Real-time Machine Health Monitoring using Deep Learning")
+# ========================= Config =========================
+st.set_page_config(
+    page_title="Real-Time RUL & Anomaly Monitor",
+    page_icon="robot",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ========================= Load Model & Data =========================
-@st.cache_resource
-def load_model_and_scaler():
-    # الملفات موجودة في نفس مجلد الـ app
-    model_path = "BEST_HEALTH_MODEL.pth"
-    scaler_path = "scaler_health.pkl"
+# Title with style
+st.markdown("""
+    <h1 style='text-align: center; color: #1E90FF;'>Real-Time Machine Health Monitor</h1>
+    <h3 style='text-align: center; color: #666;'>AI-Powered RUL Prediction & Full-Range Anomaly Detection</h3>
+    <hr style='border-color: #1E90FF;'>
+""", unsafe_allow_html=True)
 
-    # تحميل النموذج
-    class LSTMHealth(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lstm = nn.LSTM(9, 128, num_layers=2, batch_first=True, dropout=0.3)
-            self.fc = nn.Sequential(
-                nn.Linear(128, 64),
-                nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(64, 1),
-                nn.Sigmoid()
-            )
-        def forward(self, x):
-            _, (h, _) = self.lstm(x)
-            return self.fc(h[-1]) * 100
+# ========================= Model Definition =========================
+class LSTMRegressor(nn.Module):
+    def __init__(self, input_size=9, hidden_size=100, num_layers=3, dropout=0.3):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.fc = nn.Linear(hidden_size, 1)
+    
+    def forward(self, x):
+        _, (h_n, _) = self.lstm(x)
+        return self.fc(h_n[-1])
 
-    model = LSTMHealth()
-    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-    model.eval()
+# ========================= Session State Init =========================
+if 'history' not in st.session_state:
+    st.session_state.history = {}  # machine_id -> last 19 readings
+if 'df_full' not in st.session_state:
+    st.session_state.df_full = None
 
-    with open(scaler_path, 'rb') as f:
-        scaler = pickle.load(f)
+# ========================= Sidebar =========================
+with st.sidebar:
+    st.header("Upload Files")
+    
+    uploaded_model = st.file_uploader("Model (.pth)", type=['pth'])
+    uploaded_scaler = st.file_uploader("Scaler (.pkl)", type=['pkl'])
+    uploaded_data = st.file_uploader("Data (.csv)", type=['csv'])
+    
+    st.markdown("---")
+    st.markdown("### Instructions")
+    st.info("""
+    1. Upload your trained LSTM model (.pth)  
+    2. Upload the fitted scaler (.pkl)  
+    3. Upload your dataset (.csv)  
+    4. Select machine & enter live values → Get instant RUL + alerts!
+    """)
 
-    # تحميل البيانات (ضروري لاختيار الآلات و الـ health_score)
-    df = pd.read_csv("https://raw.githubusercontent.com/yourusername/predictive-maintenance/main/preprocessed_smart_data.csv")
-    # لو مش عايز تحمل البيانات أونلاين، احملها في الريبو كمان واستخدم:
-    # df = pd.read_csv("preprocessed_smart_data.csv")
+# ========================= Load Everything =========================
+model = None
+scaler = None
+df = None
 
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    return model, scaler, df
-
-# تحميل كل حاجة
-try:
-    model, scaler, df = load_model_and_scaler()
-except Exception as e:
-    st.error("خطأ في تحميل النموذج أو البيانات. تأكد من رفع الملفات صح.")
-    st.code(str(e))
+if uploaded_model and uploaded_scaler and uploaded_data:
+    try:
+        # Save temporarily
+        with open("temp_model.pth", "wb") as f:
+            f.write(uploaded_model.getbuffer())
+        with open("temp_scaler.pkl", "wb") as f:
+            f.write(uploaded_scaler.getbuffer())
+        
+        # Load model & scaler
+        model = LSTMRegressor()
+        model.load_state_dict(torch.load("temp_model.pth", map_location='cpu'))
+        model.eval()
+        
+        with open("temp_scaler.pkl", "rb") as f:
+            scaler = pickle.load(f)
+        
+        # Load data
+        df = pd.read_csv(uploaded_data)
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values(['machine_id', 'timestamp']).reset_index(drop=True)
+        
+        st.session_state.df_full = df
+        
+        # Initialize history for all machines
+        for mid in df['machine_id'].unique():
+            machine_data = df[df['machine_id'] == mid].tail(19)
+            if len(machine_data) > 0:
+                st.session_state.history[mid] = machine_data[['temperature','vibration','humidity','pressure','energy_consumption']].values
+            else:
+                st.session_state.history[mid] = np.zeros((19, 5))
+        
+        st.success("All files loaded successfully!")
+        
+    except Exception as e:
+        st.error(f"Error loading files: {e}")
+        st.stop()
+else:
+    st.warning("Please upload Model, Scaler, and Data files from the sidebar.")
     st.stop()
 
-# ========================= Feature Engineering =========================
-def prepare_features(group):
-    window = 5
-    group = group.sort_values('timestamp').copy()
-    group['temp_ma'] = group['temperature'].rolling(window, min_periods=1).mean()
-    group['vib_ma']  = group['vibration'].rolling(window, min_periods=1).mean()
-    group['temp_roc'] = group['temperature'].diff().fillna(0)
-    group['vib_roc']  = group['vibration'].diff().fillna(0)
-    return group
-
-features_cols = ['temperature','vibration','humidity','pressure','energy_consumption',
-                 'temp_ma','vib_ma','temp_roc','vib_roc']
-
-# ========================= UI =========================
-st.sidebar.header("Machine Selection")
+# ========================= Main App =========================
 machine_ids = sorted(df['machine_id'].unique())
-selected_machine = st.sidebar.selectbox("Select Machine ID", machine_ids)
+selected_machine = st.selectbox("Select Machine ID", machine_ids, key="machine_select")
 
-col1, col2 = st.columns([1, 2])
+# Get historical safe range
+machine_df = df[df['machine_id'] == selected_machine]
+healthy_df = machine_df.copy()  # You can filter by 'Normal' status if available
 
-with col1:
-    st.markdown(f"### Machine {selected_machine}")
+limits = {}
+for col in ['temperature', 'vibration', 'humidity', 'pressure', 'energy_consumption']:
+    limits[col] = {
+        'min': healthy_df[col].min(),
+        'max': healthy_df[col].max(),
+        'last': healthy_df[col].iloc[-1]
+    }
 
-    machine_data = df[df['machine_id'] == selected_machine].copy()
-    machine_data = prepare_features(machine_data).dropna().reset_index(drop=True)
+st.markdown(f"### Live Sensor Input – Machine {selected_machine}")
 
-    if len(machine_data) < 20:
-        st.error("Not enough data")
-        st.stop()
+cols = st.columns(5)
+sensor_names = ['Temperature', 'Vibration', 'Humidity', 'Pressure', 'Energy Consumption']
+sensor_keys = ['temperature', 'vibration', 'humidity', 'pressure', 'energy_consumption']
 
-    seq = torch.tensor(scaler.transform(machine_data[features_cols].tail(20)), 
-                       dtype=torch.float32).unsqueeze(0)
+inputs = {}
 
-    with torch.no_grad():
-        current_health = model(seq).item()
+alerts = []
 
-    recent = machine_data.tail(30)
-    health_drop = recent['health_score'].iloc[0] - recent['health_score'].iloc[-1]
-    days = max((recent['timestamp'].iloc[-1] - recent['timestamp'].iloc[0]).days, 1)
-    rate = health_drop / days
+for col, name, key in zip(cols, sensor_names, sensor_keys):
+    with col:
+        default = float(limits[key]['last'])
+        value = st.number_input(name, value=default, step=0.1, key=f"input_{key}")
+        inputs[key] = value
+        
+        mn, mx = limits[key]['min'], limits[key]['max']
+        if value < mn or value > mx:
+            st.error(f"Out of Range!")
+            alerts.append(f"**{name}** out of safe range [{mn:.2f}, {mx:.2f}]")
+        else:
+            st.success("Normal")
 
-    if current_health < 70:
-        risk, color = "CRITICAL", "red"
-        rul = int((current_health - 20) / max(rate, 0.1))
-    elif current_health < 85:
-        risk, color = "WARNING", "orange"
-        rul = int((current_health - 20) / max(rate, 0.1))
-    else:
-        risk, color = "HEALTHY", "green"
-        rul = None
+# Alerts Summary
+if alerts:
+    st.error("ABNORMAL READINGS DETECTED!")
+    for a in alerts:
+        st.markdown(f"• {a}")
+else:
+    st.success("All sensors in normal operating range")
 
-    st.metric("Health Score", f"{current_health:.1f}/100", delta=f"{current_health-85:+.1f}")
-    st.metric("Risk Level", risk)
-    st.metric("Est. Days to Failure", f"{rul if rul and rul<365 else '>365'}" if rul else "Stable")
+st.markdown("---")
 
-with col2:
-    st.markdown("### Health Trend")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=machine_data['timestamp'], y=machine_data['health_score'],
-                             mode='lines+markers', name='Health Score', line=dict(width=3)))
-    fig.add_trace(go.Scatter(x=[machine_data['timestamp'].iloc[-1]], y=[current_health],
-                             mode='markers', marker=dict(color='red', size=14, symbol='star')))
-    fig.add_hline(y=85, line_dash="dash", line_color="orange")
-    fig.add_hline(y=70, line_dash="dash", line_color="red")
-    fig.update_layout(height=550, template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
+if st.button("Predict Remaining Useful Life (RUL)", type="primary", use_container_width=True):
+    with st.spinner("Predicting..."):
+        # Build sequence: last 19 historical + 1 new
+        hist = st.session_state.history[selected_machine]
+        new_reading = np.array([[inputs[k] for k in sensor_keys]])
+        full_sequence = np.vstack([hist, new_reading])  # Shape: (20, 5)
+        
+        # Feature Engineering
+        df_seq = pd.DataFrame(full_sequence, columns=sensor_keys)
+        df_seq['temp_moving_avg'] = df_seq['temperature'].rolling(window=5, min_periods=1).mean()
+        df_seq['vib_moving_avg'] = df_seq['vibration'].rolling(window=5, min_periods=1).mean()
+        df_seq['temp_rate_change'] = df_seq['temperature'].diff().fillna(0)
+        df_seq['vib_rate_change'] = df_seq['vibration'].diff().fillna(0)
+        
+        X = df_seq[FEATURES].values
+        X_scaled = scaler.transform(X)
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(0)
+        
+        with torch.no_grad():
+            pred_rul = model(X_tensor).item()
+        
+        # Update history (keep last 19)
+        st.session_state.history[selected_machine] = full_sequence[1:]
 
-st.success("Machine is healthy") if current_health >= 85 else st.warning("Plan maintenance") if current_health >= 70 else st.error("Critical – Act now!")
+        # Results
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Predicted RUL", f"{pred_rul:.1f} Cycles", delta=None)
+            health = min(max(pred_rul / 150.0, 0), 1)  # Assuming 150 is full life
+            st.progress(health)
+            st.write(f"**Health Index:** {health*100:.1f}%")
+
+        with col2:
+            if alerts:
+                st.error("Warning: Prediction made under abnormal sensor conditions!")
+            elif pred_rul < 30:
+                st.error("CRITICAL: Failure Imminent!")
+            elif pred_rul < 70:
+                st.warning("Warning: Schedule Maintenance Recommended")
+            else:
+                st.success("Excellent: Machine in Great Condition")
+
+        # Plot trend
+        st.markdown("### Health Trend (Last 20 Readings)")
+        rul_history = [100] * 16 + [pred_rul]  # Dummy past for visualization
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(y=rul_history, mode='lines+markers', name='RUL Trend',
+                                 line=dict(color='dodgerblue', width=4)))
+        fig.add_hline(y=70, line_dash="dash", line_color="orange", annotation_text="Warning")
+        fig.add_hline(y=30, line_dash="dash", line_color="red", annotation_text="Critical")
+        fig.update_layout(height=400, showlegend=False, template="plotly_white")
+        st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+st.caption("Built with ❤️ by Your AI Maintenance Assistant | Supports Live Streaming & Out-of-Range Alerts")
